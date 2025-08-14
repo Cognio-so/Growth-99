@@ -1,114 +1,154 @@
-# run_command.py
-
+# routes/run-command.py
+from __future__ import annotations
 from typing import Any, Dict, Optional
+import inspect
 import json
 
-# Mirror the TS global: `global.activeSandbox`
+# These are set/synced by main.py after /api/create-ai-sandbox
 active_sandbox: Optional[Any] = None
+sandbox_state: Optional[Dict[str, Any]] = None
+sandbox_data: Optional[Dict[str, Any]] = None
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await if awaitable; otherwise return as-is."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _normalize_exec(exec_or_dict: Any) -> Dict[str, Any]:
+    """
+    Normalize various SDK outputs to a common dict:
+      {stdout: str, stderr: str, returncode: int}
+    Supports:
+      - dict results with 'output'/'stdout'/'logs'
+      - Execution-like objects with .wait(), .logs/.stdout/.output, .returncode
+    """
+    # Dict shape (some SDKs already return a dict)
+    if isinstance(exec_or_dict, dict):
+        out = exec_or_dict.get("output") or exec_or_dict.get("stdout") or exec_or_dict.get("logs") or ""
+        err = exec_or_dict.get("stderr") or exec_or_dict.get("error") or ""
+        code = exec_or_dict.get("returncode") or exec_or_dict.get("exitCode") or 0
+        try:
+            code = int(code)
+        except Exception:
+            code = 0
+        return {"stdout": str(out), "stderr": str(err), "returncode": code}
+
+    # Execution-like object
+    obj = exec_or_dict
+    wait = getattr(obj, "wait", None) or getattr(obj, "wait_for_done", None)
+    if callable(wait):
+        try:
+            wait()  # usually sync
+        except TypeError:
+            # rare async wait()
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(wait())
+        except Exception:
+            pass
+
+    out = getattr(obj, "output", None) or getattr(obj, "stdout", None) or getattr(obj, "logs", None) or ""
+    err = getattr(obj, "stderr", None) or getattr(obj, "error", None) or ""
+    code = getattr(obj, "returncode", None) or getattr(obj, "exit_code", None) or getattr(obj, "exitCode", None) or 0
+    try:
+        code = int(code)
+    except Exception:
+        code = 0
+    return {"stdout": str(out or ""), "stderr": str(err or ""), "returncode": code}
 
 
 async def POST(request: Any) -> Dict[str, Any]:
     """
-    Python equivalent of run-command.ts POST handler.
-    - No web framework; callable directly from main_app.py
-    - Same validations, logging, sandbox execution, and response shape
+    Execute a shell command inside the sandbox.
+
+    Body (JSON):
+      {
+        "command": "bash -lc 'ls -laR /home/user/app | head -n 200'",
+        "cwd": "/home/user/app"   # optional; defaults to /home/user/app
+      }
+
+    Returns:
+      {
+        "success": bool,
+        "stdout": str,
+        "stderr": str,
+        "returncode": int
+      }
     """
+    # Parse JSON body
     try:
-        # Parse JSON body like NextRequest.json()
         if hasattr(request, "json"):
-            body = await request.json()  # supports request objects with async .json()
+            body = await request.json()
         elif isinstance(request, dict):
-            body = request  # allow passing a plain dict
+            body = request
         else:
             body = {}
+    except Exception:
+        body = {}
 
-        command = body.get("command")
-        if not command:
-            # TS returned 400; here we keep the same payload keys
-            return {
-                "success": False,
-                "error": "Command is required",
-            }
+    cmd = body.get("command") or ""
+    cwd = body.get("cwd") or "/home/user/app"
 
-        if not active_sandbox:
-            # TS returned 400; here we keep the same payload keys
-            return {
-                "success": False,
-                "error": "No active sandbox",
-            }
+    if not cmd or not isinstance(cmd, str):
+        return {"success": False, "error": "Missing 'command' string", "status": 400}
 
-        print(f"[run-command] Executing: {command}")
+    if active_sandbox is None:
+        return {"success": False, "error": "No active sandbox", "status": 404}
 
-        # Build the exact embedded Python script (matches TS version)
-        # Note: JSON array syntax is also valid Python for literal lists.
-        args_literal = json.dumps(command.split(" "))
-        embedded_code = f"""
-import subprocess
-import os
+    # Pick the correct sandbox run function across SDK variants
+    run_fn = (
+        getattr(active_sandbox, "run_code", None)
+        or getattr(active_sandbox, "runCode", None)
+        or getattr(active_sandbox, "run", None)
+        or getattr(active_sandbox, "exec", None)
+    )
+    if not callable(run_fn):
+        return {"success": False, "error": "Sandbox missing run_code/runCode/run/exec", "status": 500}
 
-os.chdir('/home/user/app')
-result = subprocess.run({args_literal},
-                       capture_output=True,
-                       text=True,
-                       shell=False)
+    # We send a tiny Python script into the sandbox that executes your shell command and prints JSON
+    py = f"""
+import subprocess, json, os
+cmd = {json.dumps(cmd)}
+cwd = {json.dumps(cwd)}
+try:
+    proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    print(json.dumps({{
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr
+    }}))
+except Exception as e:
+    print(json.dumps({{"returncode": 1, "stdout": "", "stderr": str(e)}}))
+"""
 
-print("STDOUT:")
-print(result.stdout)
-if result.stderr:
-    print("\\nSTDERR:")
-    print(result.stderr)
-print(f"\\nReturn code: {{result.returncode}}")
-""".lstrip("\n")
+    # IMPORTANT: do NOT blindly `await` — some SDKs return Execution objects
+    result = run_fn(py)
+    result = await _maybe_await(result)
 
-        # Use LangChain Runnable if available; otherwise call sandbox directly
-        result: Any
-        try:
-            from langchain_core.runnables import RunnableLambda  # type: ignore
+    norm = _normalize_exec(result)
 
-            async def _runner(code: str) -> Any:
-                # Prefer a Pythonic method name if provided; fallback to TS-style
-                if hasattr(active_sandbox, "run_code"):
-                    return await active_sandbox.run_code(code)
-                return await active_sandbox.runCode(code)  # type: ignore[attr-defined]
+    # If stdout contains the JSON we printed from the sandbox, parse it for exact fields
+    parsed = None
+    try:
+        parsed = json.loads(norm.get("stdout", ""))
+    except Exception:
+        parsed = None
 
-            chain = RunnableLambda(_runner)
-            result = await chain.ainvoke(embedded_code)
-        except Exception:
-            # Fallback: direct sandbox call without LangChain
-            if hasattr(active_sandbox, "run_code"):
-                result = await active_sandbox.run_code(embedded_code)
-            else:
-                result = await active_sandbox.runCode(embedded_code)  # type: ignore[attr-defined]
-
-        # Extract output like in TS: result.logs.stdout.join('\n')
-        output: Optional[str] = None
-        if isinstance(result, dict):
-            try:
-                stdout_list = result["logs"]["stdout"]
-                if isinstance(stdout_list, list):
-                    output = "\n".join(stdout_list)
-            except Exception:
-                # Sometimes providers return a flat 'output'
-                output = result.get("output")  # type: ignore[assignment]
-        else:
-            # Attribute-style access
-            logs = getattr(result, "logs", None)
-            if logs is not None:
-                stdout_list = getattr(logs, "stdout", None)
-                if isinstance(stdout_list, list):
-                    output = "\n".join(stdout_list)
-            if output is None:
-                output = getattr(result, "output", None)
-
+    if isinstance(parsed, dict) and "returncode" in parsed:
+        rc = int(parsed.get("returncode", 0))
         return {
-            "success": True,
-            "output": output,
-            "message": "Command executed successfully",
+            "success": rc == 0,
+            "stdout": parsed.get("stdout", ""),
+            "stderr": parsed.get("stderr", ""),
+            "returncode": rc,
         }
 
-    except Exception as error:
-        print("[run-command] Error:", error)
-        return {
-            "success": False,
-            "error": str(error),
-        }
+    # Fallback to normalized fields
+    return {
+        "success": norm.get("returncode", 0) == 0,
+        "stdout": norm.get("stdout", ""),
+        "stderr": norm.get("stderr", ""),
+        "returncode": norm.get("returncode", 0),
+    }

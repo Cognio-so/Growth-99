@@ -4,7 +4,7 @@
 # - Uses LangChain RunnableLambda + a minimal LangGraph node to run code in the sandbox
 # - Preserves file enumeration logic, manifest construction, and route extraction
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import json
 import time
 import re
@@ -26,28 +26,42 @@ sandbox_state: Optional[Dict[str, Any]] = None
 
 
 # ---- Helpers: sandbox execution via LangChain + LangGraph ----
-async def _run_in_sandbox(code: str) -> Dict[str, Any]:
+async def _run_in_sandbox(code: str) -> Any:
     """
     Run arbitrary code inside the sandbox using either .run_code or .runCode.
     Wrapped with LangChain RunnableLambda and dispatched via a one-node LangGraph.
+    IMPORTANT: Some SDKs return an Execution object (not awaitable). We call .wait() if present.
     """
-    async def _runner(payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _runner(payload: Dict[str, Any]) -> Any:
         c = payload.get("code", "")
         if not active_sandbox:
             return {"output": ""}
         run = getattr(active_sandbox, "run_code", None) or getattr(active_sandbox, "runCode", None)
         if run is None:
             return {"output": ""}
-        if inspect.iscoroutinefunction(run):
-            return await run(c)
-        return run(c)
+
+        # Call the sandbox. Some SDKs return an Execution object immediately.
+        res = await run(c) if inspect.iscoroutinefunction(run) else run(c)
+
+        # If it's an Execution-like object, wait for completion so logs/output are available.
+        wait = getattr(res, "wait", None) or getattr(res, "wait_for_done", None)
+        if callable(wait):
+            try:
+                wait()  # usually sync
+            except TypeError:
+                # rare async wait()
+                import asyncio
+                asyncio.get_event_loop().run_until_complete(wait())
+            except Exception:
+                pass
+        return res
 
     chain = RunnableLambda(_runner)
 
     def _compile_graph():
         g = StateGraph(dict)
 
-        async def exec_node(state: Dict[str, Any]) -> Dict[str, Any]:
+        async def exec_node(state: Dict[str, Any]) -> Any:
             return await chain.ainvoke(state)
 
         g.add_node("exec", exec_node)
@@ -67,18 +81,37 @@ def _extract_output_text(result: Any) -> str:
     Best-effort extraction of text output from various runner result shapes.
     Mirrors TS behavior (result.logs.stdout.join('')) when available.
     """
+    # dict result (some SDKs already return merged output)
     if isinstance(result, dict):
-        # Prefer direct 'output'
         out = result.get("output")
-        if isinstance(out, str):
+        if isinstance(out, str) and out:
             return out
 
-        # E2B-like shape: logs.stdout array
         logs = result.get("logs")
         if isinstance(logs, dict):
             stdout = logs.get("stdout")
             if isinstance(stdout, list) and all(isinstance(x, str) for x in stdout):
                 return "".join(stdout)
+        # fallback
+        flat_stdout = result.get("stdout")
+        if isinstance(flat_stdout, str):
+            return flat_stdout
+        return ""
+
+    # Execution-like object: prefer logs.stdout, then output/stdout fields
+    logs = getattr(result, "logs", None)
+    if logs is not None:
+        stdout_list = getattr(logs, "stdout", None)
+        if isinstance(stdout_list, list):
+            return "".join(stdout_list)
+        if isinstance(stdout_list, str):
+            return stdout_list
+
+    # direct fields sometimes exist
+    out = getattr(result, "output", None) or getattr(result, "stdout", None)
+    if isinstance(out, str):
+        return out
+
     return ""
 
 
@@ -190,11 +223,11 @@ import json
 def get_files_content(directory='/home/user/app', extensions=['.jsx', '.js', '.tsx', '.ts', '.css', '.json']):
     files_content = {}
     
-    for root, dirs, files in os.walk(directory):
+    for root, dirs, fnames in os.walk(directory):
         # Skip node_modules and other unwanted directories
         dirs[:] = [d for d in dirs if d not in ['node_modules', '.git', 'dist', 'build']]
         
-        for file in files:
+        for file in fnames:
             if any(file.endswith(ext) for ext in extensions):
                 file_path = os.path.join(root, file)
                 relative_path = os.path.relpath(file_path, '/home/user/app')
@@ -210,27 +243,28 @@ def get_files_content(directory='/home/user/app', extensions=['.jsx', '.js', '.t
     
     return files_content
 
-# Get the files
-files = get_files_content()
+# Get the files (dict)
+files_map = get_files_content()
 
 # Also get the directory structure
 structure = []
-for root, dirs, files in os.walk('/home/user/app'):
+for root, dirs, fnames in os.walk('/home/user/app'):
     level = root.replace('/home/user/app', '').count(os.sep)
     indent = ' ' * 2 * level
     structure.append(f"{indent}{os.path.basename(root)}/")
     sub_indent = ' ' * 2 * (level + 1)
-    for file in files:
+    for file in fnames:
         if not any(skip in root for skip in ['node_modules', '.git', 'dist', 'build']):
             structure.append(f"{sub_indent}{file}")
 
 result = {
-    'files': files,
-    'structure': '\\n'.join(structure[:50])  # Limit structure to 50 lines
+    'files': files_map,                       # <-- dict, not the fnames list
+    'structure': '\\n'.join(structure[:50])   # Limit structure to 50 lines
 }
 
 print(json.dumps(result))
 """.lstrip("\n")
+
         # ========================================================
 
         run_result = await _run_in_sandbox(sandbox_code)
@@ -249,6 +283,10 @@ print(json.dumps(result))
         }
 
         files_dict = parsed_result.get("files", {}) or {}
+        # handle rare case where a list slipped through
+        if isinstance(files_dict, list):
+            files_dict = {name: "" for name in files_dict}
+
         for relative_path, content in files_dict.items():
             full_path = f"/home/user/app/{relative_path}"
 

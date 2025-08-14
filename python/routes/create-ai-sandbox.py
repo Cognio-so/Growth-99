@@ -20,11 +20,16 @@ try:
 except Exception as _e:
     raise
 
-# --- E2B Sandbox (python SDK) ---
+# --- E2B Sandbox (prefer pythonic SDK; fallback to legacy) ---
 try:
-    from e2b import Sandbox as E2BSandbox  # type: ignore
+    # Preferred Python SDK
+    from e2b_code_interpreter import Sandbox as E2BSandbox  # type: ignore
 except Exception:
-    E2BSandbox = None  # We'll error nicely if it's not installed
+    try:
+        # Fallback if only 'e2b' is installed; some versions export Sandbox here
+        from e2b import Sandbox as E2BSandbox  # type: ignore
+    except Exception:
+        E2BSandbox = None  # We'll error nicely if it's not installed
 
 # --- App config shim to mirror appConfig.e2b.* ---
 # In TS: import { appConfig } from '@/config/app.config';
@@ -36,9 +41,9 @@ except Exception:
     appConfig = SimpleNamespace(
         e2b=SimpleNamespace(
             timeoutMinutes=15,
-            timeoutMs=15 * 60 * 1000,    # ms
+            timeoutMs=15 * 60 * 1000,  # ms
             vitePort=5173,
-            viteStartupDelay=4000,       # ms
+            viteStartupDelay=4000,  # ms
         )
     )
 
@@ -52,14 +57,19 @@ sandbox_state: Optional[Dict[str, Any]] = None
 # --- Helpers (LangChain + LangGraph) ---
 async def _run_in_sandbox(sandbox: Any, code: str) -> Dict[str, Any]:
     """
-    Run arbitrary code inside the sandbox using either .run_code or .runCode.
+    Run arbitrary code inside the sandbox using .run_code / .runCode / .run / .exec (SDKs vary).
     Wrapped with LangChain RunnableLambda and dispatched via a one-node LangGraph.
     """
     async def _runner(payload: Dict[str, Any]) -> Dict[str, Any]:
         c = payload.get("code", "")
-        run = getattr(sandbox, "run_code", None) or getattr(sandbox, "runCode", None)
+        run = (
+            getattr(sandbox, "run_code", None)
+            or getattr(sandbox, "runCode", None)
+            or getattr(sandbox, "run", None)
+            or getattr(sandbox, "exec", None)
+        )
         if run is None:
-            raise RuntimeError("Sandbox missing run_code/runCode")
+            raise RuntimeError("Sandbox missing run_code/runCode/run/exec")
         if inspect.iscoroutinefunction(run):
             return await run(c)
         return run(c)
@@ -109,7 +119,7 @@ async def POST() -> Dict[str, Any]:
         if active_sandbox:
             print("[create-ai-sandbox] Killing existing sandbox...")
             try:
-                killer = getattr(active_sandbox, "kill", None)
+                killer = getattr(active_sandbox, "kill", None) or getattr(active_sandbox, "close", None)
                 if killer:
                     if inspect.iscoroutinefunction(killer):
                         await killer()
@@ -123,28 +133,38 @@ async def POST() -> Dict[str, Any]:
         existing_files.clear()
 
         # Create base sandbox - we'll set up Vite ourselves for full control
-        print(f"[create-ai-sandbox] Creating base E2B sandbox with {appConfig.e2b.timeoutMinutes} minute timeout...")
+        print(
+            f"[create-ai-sandbox] Creating base E2B sandbox with {appConfig.e2b.timeoutMinutes} minute timeout..."
+        )
         if E2BSandbox is None:
-            raise RuntimeError("E2B Sandbox library not available; install the 'e2b' Python package.")
+            raise RuntimeError(
+                "E2B Sandbox library not available; install 'e2b-code-interpreter' (preferred) or 'e2b'."
+            )
 
-        # Try to match TS: Sandbox.create({ apiKey, timeoutMs })
-        create_kwargs = {
-            "api_key": os.getenv("E2B_API_KEY"),
-            "timeout_ms": appConfig.e2b.timeoutMs,
-        }
+        # Python SDK: construct; Node-style .create(...) does not exist.
         try:
-            sandbox = await E2BSandbox.create(**create_kwargs)  # type: ignore[arg-type]
+            sandbox = E2BSandbox(api_key=os.getenv("E2B_API_KEY"))  # type: ignore[call-arg]
         except TypeError:
-            # Some SDKs might expect 'timeoutMs'
-            create_kwargs = {
-                "apiKey": os.getenv("E2B_API_KEY"),
-                "timeoutMs": appConfig.e2b.timeoutMs,
-            }
-            sandbox = await E2BSandbox.create(**create_kwargs)  # type: ignore[arg-type]
+            # Some SDK builds don't accept api_key kwarg; rely on env var
+            sandbox = E2BSandbox()  # type: ignore[call-arg]
 
-        sandbox_id = getattr(sandbox, "sandboxId", None) or str(int(asyncio.get_event_loop().time() * 1000))
-        get_host = getattr(sandbox, "getHost", None)
-        host = get_host(appConfig.e2b.vitePort) if callable(get_host) else f"localhost:{appConfig.e2b.vitePort}"
+        # Try to set/extend timeout if SDK supports it
+        set_timeout = getattr(sandbox, "set_timeout", None) or getattr(sandbox, "setTimeout", None)
+        if callable(set_timeout):
+            try:
+                set_timeout(appConfig.e2b.timeoutMs)
+                print(f"[create-ai-sandbox] Set sandbox timeout to {appConfig.e2b.timeoutMinutes} minutes")
+            except Exception:
+                pass
+
+        # Identify sandbox + host (Python SDKs don't usually expose getHost)
+        sandbox_id = (
+            getattr(sandbox, "sandbox_id", None)
+            or getattr(sandbox, "id", None)
+            or getattr(sandbox, "sandboxId", None)
+            or str(int(asyncio.get_event_loop().time() * 1000))
+        )
+        host = f"localhost:{appConfig.e2b.vitePort}"
 
         print(f"[create-ai-sandbox] Sandbox created: {sandbox_id}")
         print(f"[create-ai-sandbox] Sandbox host: {host}")
@@ -318,7 +338,7 @@ body {
 }"""
 
 with open('/home/user/app/src/index.css', 'w') as f:
-  f.write(index_css)
+    f.write(index_css)
 print('✓ src/index.css')
 
 print('\\nAll files created successfully!')
@@ -357,7 +377,7 @@ import time
 
 os.chdir('/home/user/app')
 
-# Kill any existing Vite processes
+# Kill any existing Vite processes (best-effort; harmless on Windows)
 subprocess.run(['pkill', '-f', 'vite'], capture_output=True)
 time.sleep(1)
 
@@ -404,15 +424,6 @@ print('✓ Tailwind CSS should be loaded')
             "url": f"https://{host}",
         }
 
-        # Set extended timeout if supported
-        set_timeout = getattr(sandbox, "setTimeout", None) or getattr(sandbox, "set_timeout", None)
-        if callable(set_timeout):
-            try:
-                set_timeout(appConfig.e2b.timeoutMs)
-                print(f"[create-ai-sandbox] Set sandbox timeout to {appConfig.e2b.timeoutMinutes} minutes")
-            except Exception:
-                pass
-
         # Initialize sandbox state
         sandbox_state = {
             "fileCache": {
@@ -450,7 +461,7 @@ print('✓ Tailwind CSS should be loaded')
         # Clean up on error
         if sandbox:
             try:
-                killer = getattr(sandbox, "kill", None)
+                killer = getattr(sandbox, "kill", None) or getattr(sandbox, "close", None)
                 if killer:
                     if inspect.iscoroutinefunction(killer):
                         await killer()

@@ -1,12 +1,22 @@
-# requirements.txt
-
-# For the FastAPI backend
 fastapi
 uvicorn[standard]
-httpx
-python-dotenv
 pydantic
-
-# For the Streamlit UI
-streamlit
+python-dotenv
+httpx
 requests
+aiohttp
+langchain
+langchain-core
+langchain-community
+langsmith
+langgraph
+langchain-openai
+langchain-anthropic
+langchain-google-genai
+langchain-groq
+e2b
+e2b-code-interpreter
+sse-starlette
+streamlit
+python-multipart
+Pillow
