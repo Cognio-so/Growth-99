@@ -1,0 +1,12 @@
+# requirements.txt
+
+# For the FastAPI backend
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
+
+# For the Streamlit UI
+streamlit
+requests
